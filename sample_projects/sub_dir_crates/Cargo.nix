@@ -702,6 +702,17 @@ rec {
     corresponding feature sets are merged. Features in rust are additive.
   */
   mergePackageFeatures =
+    args: builtins.mapAttrs (_packageId: builtins.attrNames) (mergePackageFeaturesImpl args);
+
+  /*
+    Core of the feature-resolution fixpoint. The cache (`featuresByPackageId`)
+    maps each packageId to a feature *set* (an attrset `feature -> 1`) rather
+    than a sorted list, so the fold merges with `//` and detects convergence
+    with attrset equality instead of re-concatenating and re-sorting the
+    accumulated feature list on every step. `mergePackageFeatures` projects the
+    result back to canonical sorted lists.
+  */
+  mergePackageFeaturesImpl =
     { crateConfigs ? crates
     , packageId
     , rootPackageId ? packageId
@@ -750,14 +761,15 @@ rec {
               cache:
               { packageId, features }:
               let
-                cacheFeatures = cache.${packageId} or [ ];
-                combinedFeatures = sortedUnique (cacheFeatures ++ features);
+                cacheFeatures = cache.${packageId} or { };
+                # `features` is the (small) incoming list; merge it into the set.
+                combinedFeatures = cacheFeatures // listToSet features;
               in
-              if cache ? ${packageId} && cache.${packageId} == combinedFeatures then
+              if cache ? ${packageId} && cacheFeatures == combinedFeatures then
                 cache
               else
-                mergePackageFeatures {
-                  features = combinedFeatures;
+                mergePackageFeaturesImpl {
+                  features = builtins.attrNames combinedFeatures;
                   featuresByPackageId = cache;
                   inherit
                     crateConfigs
@@ -770,8 +782,8 @@ rec {
             );
         cacheWithSelf =
           let
-            cacheFeatures = featuresByPackageId.${packageId} or [ ];
-            combinedFeatures = sortedUnique (cacheFeatures ++ enabledFeatures);
+            cacheFeatures = featuresByPackageId.${packageId} or { };
+            combinedFeatures = cacheFeatures // listToSet enabledFeatures;
           in
           featuresByPackageId
           // {
@@ -798,27 +810,31 @@ rec {
       assert (builtins.isList features);
       assert (builtins.isAttrs target);
 
+      let
+        # Identical for every dep in this call; build the predicate arg once.
+        targetArgs = { inherit features target; };
+      in
       lib.filter
         (
           dep:
-          let
-            targetFunc = dep.target or (features: true);
-          in
-          targetFunc { inherit features target; }
+          (dep.target or (features: true)) targetArgs
           && (!(dep.optional or false) || builtins.any (doesFeatureEnableDependency dep) features)
         )
         dependencies;
 
   # Returns whether the given feature should enable the given dependency.
   doesFeatureEnableDependency =
-    dependency: feature:
+    dependency:
+    # Callers partially apply this once per dependency, then test every feature,
+    # so hoist the dep-invariant strings out of the per-feature comparison.
     let
       name = dependency.rename or dependency.name;
+      depName = "dep:" + name;
       prefix = "${name}/";
       len = builtins.stringLength prefix;
-      startsWithPrefix = builtins.substring 0 len feature == prefix;
     in
-    feature == name || feature == "dep:" + name || startsWithPrefix;
+    feature:
+    feature == name || feature == depName || builtins.substring 0 len feature == prefix;
 
   /*
     Returns the expanded features for the given inputFeatures by applying the
@@ -908,17 +924,19 @@ rec {
       in
       defaultOrNil ++ explicitFeatures ++ additionalDependencyFeatures;
 
+  # Builds a feature set (attrset `feature -> 1`) from a list of feature names.
+  listToSet =
+    features:
+    builtins.listToAttrs (map (feature: { name = feature; value = 1; }) features);
+
   # Sorts and removes duplicates from a list of strings.
   sortedUnique =
     features:
       assert (builtins.isList features);
-      assert (builtins.all builtins.isString features);
       # attrNames returns keys in ascending string order, so the result is
       # sorted and deduplicated. The feature-merge fixpoint relies on this
       # canonical order to detect convergence.
-      builtins.attrNames (
-        builtins.listToAttrs (map (feature: { name = feature; value = 1; }) features)
-      );
+      builtins.attrNames (listToSet features);
 
   deprecationWarning =
     message: value:
